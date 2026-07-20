@@ -61,7 +61,7 @@
   }
   .month-label{font-family:var(--mono); font-size:13px; color:var(--muted); min-width:150px; text-align:center;}
 
-  .backup-row{display:flex; align-items:center; justify-content:center; gap:8px; margin-top:10px;}
+  .backup-row{display:flex; align-items:center; justify-content:center; gap:8px; margin-top:10px; flex-wrap:wrap;}
   .backup-row button{
     background:var(--panel-2); border:1px solid var(--rail); color:var(--muted);
     padding:6px 12px; border-radius:8px; font-size:11.5px; font-weight:600; display:flex; align-items:center; gap:5px;
@@ -196,6 +196,7 @@
 
   a{color:var(--copper-bright);}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 </head>
 <body>
 
@@ -218,6 +219,7 @@
   <div class="backup-row">
     <button id="exportBtn">⬇ Экспорт копии</button>
     <button id="importBtn">⬆ Загрузить копию</button>
+    <button id="exportExcelBtn">📊 В Excel</button>
     <input type="file" id="importFile" accept="application/json" style="display:none">
   </div>
   <div class="save-status" id="saveStatus">—</div>
@@ -326,6 +328,12 @@
     "Покупки на работу","Рестораны","Деньги для жены","Лекарства","Погашение долга","Прочее"
   ];
 
+  function allCats(type){
+    var base = type === 'income' ? INCOME_CATS : EXPENSE_CATS;
+    var custom = (state.customCats && state.customCats[type]) ? state.customCats[type] : [];
+    return base.concat(custom);
+  }
+
   function storageWorks(){
     try{
       var k = "__schitok_test__";
@@ -384,6 +392,7 @@
   var state = loadState();
   if(!state.debts || !state.debts.length) state.debts = JSON.parse(JSON.stringify(DEFAULT_DEBTS));
   if(!state.transactions) state.transactions = [];
+  if(!state.customCats) state.customCats = {income: [], expense: []};
 
   var viewDate = new Date();
   viewDate.setHours(0,0,0,0);
@@ -504,11 +513,36 @@
 
   var currentType = 'income';
 
-  function populateCatSelect(){
+  function populateCatSelect(keepValue){
     var sel = document.getElementById('catSelect');
-    var cats = currentType === 'income' ? INCOME_CATS : EXPENSE_CATS;
-    sel.innerHTML = cats.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+    var prev = keepValue ? sel.value : null;
+    var cats = allCats(currentType);
+    var opts = cats.map(function(c){ return '<option value="'+c+'">'+c+'</option>'; }).join('');
+    opts += '<option value="__add__">+ Добавить свою категорию…</option>';
+    sel.innerHTML = opts;
+    if(prev && cats.indexOf(prev) !== -1) sel.value = prev;
     document.getElementById('compField').style.display = (currentType === 'expense') ? '' : 'none';
+    toggleCompVisibility();
+  }
+  function handleNewCategory(){
+    var sel = document.getElementById('catSelect');
+    var name = prompt(currentType === 'income' ? 'Название новой статьи дохода:' : 'Название новой статьи расхода:');
+    if(name){
+      name = name.trim();
+    }
+    if(!name){
+      sel.value = allCats(currentType)[0] || '';
+      toggleCompVisibility();
+      return;
+    }
+    var list = state.customCats[currentType];
+    var exists = allCats(currentType).some(function(c){ return c.toLowerCase() === name.toLowerCase(); });
+    if(!exists){
+      list.push(name);
+      saveState();
+    }
+    populateCatSelect();
+    sel.value = name;
     toggleCompVisibility();
   }
   function toggleCompVisibility(){
@@ -556,7 +590,10 @@
     b.classList.add('active');
     populateCatSelect();
   });
-  document.getElementById('catSelect').addEventListener('change', toggleCompVisibility);
+  document.getElementById('catSelect').addEventListener('change', function(){
+    if(this.value === '__add__'){ handleNewCategory(); return; }
+    toggleCompVisibility();
+  });
 
   document.getElementById('addTxBtn').addEventListener('click', function(){
     var amount = parseFloat(document.getElementById('amountInput').value);
@@ -700,6 +737,101 @@
     reader.readAsText(file);
     e.target.value = '';
   });
+  document.getElementById('exportExcelBtn').addEventListener('click', exportExcel);
+
+  function exportExcel(){
+    if(typeof XLSX === 'undefined'){
+      alert('Модуль Excel не загрузился — нужен интернет хотя бы на секунду для первой загрузки. Проверьте соединение и попробуйте ещё раз.');
+      return;
+    }
+    if(!state.transactions.length){
+      alert('Пока нет ни одной записи — добавьте операции, потом экспортируйте.');
+      return;
+    }
+
+    function toExcelDate(dateStr){ return new Date(dateStr + 'T00:00:00'); }
+    function computeTotals(start, end){
+      var inc=0, exp=0, comp=0;
+      state.transactions.forEach(function(t){
+        var d = new Date(t.date + 'T12:00:00');
+        if(d >= start && d <= end){
+          if(t.type === 'income') inc += t.amount;
+          else { exp += t.amount; if(t.compensable) comp += t.amount; }
+        }
+      });
+      var net = exp - comp;
+      return {inc:inc, exp:exp, comp:comp, net:net, bal:inc-net};
+    }
+    function setColFmt(ws, col, range, fmt){
+      for(var r = range[0]; r <= range[1]; r++){
+        var addr = col + r;
+        if(ws[addr]) ws[addr].z = fmt;
+      }
+    }
+
+    var now = new Date(); now.setHours(0,0,0,0);
+    var dayStart = new Date(now), dayEnd = new Date(now); dayEnd.setHours(23,59,59,999);
+    var weekStart = startOfWeek(now);
+    var weekEnd = new Date(weekStart); weekEnd.setDate(weekStart.getDate()+6); weekEnd.setHours(23,59,59,999);
+    var monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    var monthEnd = new Date(now.getFullYear(), now.getMonth()+1, 0); monthEnd.setHours(23,59,59,999);
+    var yearStart = new Date(now.getFullYear(), 0, 1);
+    var yearEnd = new Date(now.getFullYear(), 11, 31); yearEnd.setHours(23,59,59,999);
+
+    var sumRows = [["Период","Начало","Конец","Доход, ₽","Расход, ₽","Компенсируется, ₽","Чистый расход, ₽","Баланс, ₽"]];
+    [["Сегодня", dayStart, dayEnd], ["Эта неделя", weekStart, weekEnd],
+     ["Этот месяц", monthStart, monthEnd], ["Этот год", yearStart, yearEnd]].forEach(function(p){
+      var t = computeTotals(p[1], p[2]);
+      sumRows.push([p[0], p[1], p[2], t.inc, t.exp, t.comp, t.net, t.bal]);
+    });
+    var wsSum = XLSX.utils.aoa_to_sheet(sumRows);
+    wsSum['!cols'] = [{wch:14},{wch:12},{wch:12},{wch:13},{wch:13},{wch:16},{wch:16},{wch:13}];
+    setColFmt(wsSum, 'B', [2,5], 'dd.mm.yyyy');
+    setColFmt(wsSum, 'C', [2,5], 'dd.mm.yyyy');
+    ['D','E','F','G','H'].forEach(function(c){ setColFmt(wsSum, c, [2,5], '#,##0" ₽"'); });
+
+    var byCat = {};
+    state.transactions.forEach(function(t){
+      if(t.type === 'expense') byCat[t.category] = (byCat[t.category] || 0) + t.amount;
+    });
+    var catRows = [["Категория расхода","Сумма за всё время, ₽"]];
+    Object.keys(byCat).sort(function(a,b){ return byCat[b]-byCat[a]; }).forEach(function(c){
+      catRows.push([c, byCat[c]]);
+    });
+    var wsCat = XLSX.utils.aoa_to_sheet(catRows);
+    wsCat['!cols'] = [{wch:26},{wch:20}];
+    setColFmt(wsCat, 'B', [2, catRows.length], '#,##0" ₽"');
+
+    var opRows = [["Дата","Тип","Категория","Сумма, ₽","Компенсируется","Заметка"]];
+    state.transactions.slice().sort(function(a,b){ return new Date(a.date)-new Date(b.date); }).forEach(function(t){
+      opRows.push([toExcelDate(t.date), t.type === 'income' ? 'Доход' : 'Расход', t.category, t.amount,
+        t.compensable ? 'Да' : 'Нет', t.note || '']);
+    });
+    var wsOp = XLSX.utils.aoa_to_sheet(opRows);
+    wsOp['!cols'] = [{wch:12},{wch:10},{wch:22},{wch:12},{wch:15},{wch:32}];
+    setColFmt(wsOp, 'A', [2, opRows.length], 'dd.mm.yyyy');
+    setColFmt(wsOp, 'D', [2, opRows.length], '#,##0" ₽"');
+
+    var debtRows = [["Название долга","Начальная сумма, ₽","Остаток, ₽","Погашено, %"]];
+    state.debts.forEach(function(d){
+      var pct = d.initial > 0 ? Math.round((1 - d.balance/d.initial)*100) : 100;
+      debtRows.push([d.name, d.initial, d.balance, pct/100]);
+    });
+    var wsDebt = XLSX.utils.aoa_to_sheet(debtRows);
+    wsDebt['!cols'] = [{wch:22},{wch:18},{wch:14},{wch:12}];
+    setColFmt(wsDebt, 'B', [2, debtRows.length], '#,##0" ₽"');
+    setColFmt(wsDebt, 'C', [2, debtRows.length], '#,##0" ₽"');
+    setColFmt(wsDebt, 'D', [2, debtRows.length], '0%');
+
+    var wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, wsSum, "Сводка");
+    XLSX.utils.book_append_sheet(wb, wsCat, "Категории");
+    XLSX.utils.book_append_sheet(wb, wsOp, "Операции");
+    XLSX.utils.book_append_sheet(wb, wsDebt, "Долги");
+
+    XLSX.writeFile(wb, "schitok-" + toKey(new Date()) + ".xlsx");
+  }
+
   document.getElementById('closeBanner').addEventListener('click', function(){
     document.getElementById('storageBanner').style.display = 'none';
   });
